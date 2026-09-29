@@ -1,10 +1,22 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import childProcess from "node:child_process";
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { syncBuiltinESMExports } from "node:module";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import pensieve, { appendJournal, buildSnapshot, isNone, localDate, newJournal, openItems, resolveConfig } from "../index.ts";
+
+const agentDir = process.env.PI_CODING_AGENT_DIR = mkdtempSync(join(tmpdir(), "pi-pensieve-test-"));
+const load = () => {
+  const on: Record<string, Function> = {};
+  pensieve({ on: (name: string, handler: Function) => { on[name] = handler; }, registerCommand() {} } as never);
+  return on;
+};
+const writeSettings = (settings: object) => {
+  mkdirSync(join(agentDir, "extensions"), { recursive: true });
+  writeFileSync(join(agentDir, "extensions/pensieve.json"), JSON.stringify(settings));
+};
 
 test("Pensieve memory helpers", () => {
   const file = { mcpServers: { pensieve: {
@@ -50,8 +62,7 @@ test("retries a failed snapshot on a later turn, at most once a minute", async t
     return String(url).endsWith("/mcp") ? Response.json({ result: { instructions: "guide" } }) : new Response(null, { status: 404 });
   });
   t.mock.timers.enable({ apis: ["Date"] });
-  const on: Record<string, Function> = {};
-  pensieve({ on: (name: string, handler: Function) => { on[name] = handler; } } as never);
+  const on = load();
   const ctx = { hasUI: false };
   const turn = async () => {
     const event = { systemPromptOptions: {} as { sections?: Record<string, string> } };
@@ -91,10 +102,10 @@ test("quitting hands the summary to a detached pi that appends it to the journal
   const message = (role: string, text: string) => ({ type: "message", message: { role, content: [{ type: "text", text }], stopReason: "stop", timestamp: 0 } });
   const branch = (...messages: ReturnType<typeof message>[]) => messages.map((entry, i) => ({ ...entry, id: String(i), parentId: i ? String(i - 1) : null }));
   const entries = branch(message("user", "a"), message("assistant", "b"), message("user", "c"), message("assistant", "d"));
-  const on: Record<string, Function> = {};
-  pensieve({ on: (name: string, handler: Function) => { on[name] = handler; } } as never);
+  const on = load();
   const ctx = {
-    hasUI: true, cwd: "/work/repo", model: { provider: "p", id: "m" }, modelRegistry: { find: () => undefined },
+    hasUI: true, cwd: "/work/repo", model: { provider: "p", id: "m" },
+    modelRegistry: { find: (provider: string, id: string) => provider === "q" ? { provider, id } : undefined },
     ui: { notify() {} }, sessionManager: { getBranch: () => entries, getSessionId: () => "abcdefgh-123" },
   };
   await on.session_start({}, ctx);
@@ -105,7 +116,9 @@ test("quitting hands the summary to a detached pi that appends it to the journal
   const transcript = join(job.dir, "conversation.md");
   assert.ok(options.detached);
   assert.equal(options.cwd, "/work/repo");
-  assert.deepEqual(args.slice(args.indexOf("--model"), args.indexOf("--model") + 2), ["--model", "p/m"]);
+  const flag = (args: string[], name: string) => args[args.indexOf(name) + 1];
+  assert.equal(flag(args, "--model"), "p/m");
+  assert.equal(flag(args, "--thinking"), "low");
   assert.ok(args.includes("-nt") && args.includes("--no-session") && args.at(-1) === `@${transcript}`);
   assert.match(readFileSync(transcript, "utf8"), /^<conversation>\n[\s\S]*d\n<\/conversation>\n$/);
 
@@ -120,4 +133,18 @@ test("quitting hands the summary to a detached pi that appends it to the journal
   assert.equal(puts.length, 1);
   assert.equal(puts[0]!.url, `http://pensieve.test/api/pages/${encodeURIComponent(`Journal ${localDate(time)}`)}`);
   assert.equal(puts[0]!.body.content, appendJournal(newJournal(localDate(time)), "### Decisions\n- Choice", time, "repo", "abcdefgh-123"));
+
+  delete process.env.PI_PENSIEVE_JOB;
+  writeSettings({ journal: { model: "q/r/s", thinking: "high" } });
+  const custom = load();
+  await custom.session_start({}, ctx);
+  await custom.session_shutdown({ reason: "quit" }, ctx);
+  assert.equal(flag(spawned[1]!.args, "--model"), "q/r/s");
+  assert.equal(flag(spawned[1]!.args, "--thinking"), "high");
+
+  writeSettings({ journal: { enabled: false } });
+  const off = load();
+  await off.session_start({}, ctx);
+  await off.session_shutdown({ reason: "quit" }, ctx);
+  assert.equal(spawned.length, 2);
 });

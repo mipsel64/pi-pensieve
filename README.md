@@ -37,6 +37,8 @@ It replaces [pi-memory](https://github.com/jayzeng/pi-memory)'s local daily logs
    pi install npm:@mipsel64/pi-pensieve
    ```
 
-`PI_PENSIEVE_SUMMARY_MODEL=provider/model-id` picks a cheaper model for session summaries; otherwise the session's model writes them.
-
 If Pensieve can't be reached, Pi starts without memory, warns once, and retries on a later turn.
+
+## Settings
+
+`/pensieve:settings` turns the journal on or off and chooses the model and thinking level that write the summaries. By default, the session's own model writes them with low thinking. As in pi-processes' `/ps:settings`, the Global, Local and Memory tabs apply everywhere, in this project, or only to this session. Ctrl+S saves the Global tab to `~/.pi/agent/extensions/pensieve.json` and the Local tab to `.pi/extensions/pensieve.json`.
