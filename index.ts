@@ -124,6 +124,7 @@ export default function pensieve(pi: ExtensionAPI): void {
   let config: Config | undefined;
   let current = "";
   let takenOn = "";
+  let retryAt = 0;
   let warned = false;
   const warn = (ctx: { hasUI: boolean; ui: { notify: (text: string, level: "warning") => void } }) => {
     if (!warned) {
@@ -134,14 +135,19 @@ export default function pensieve(pi: ExtensionAPI): void {
   const refresh = async (ctx: ExtensionContext) => {
     if (!config) return;
     const now = new Date();
-    current = await snapshot(config, now, () => warn(ctx)) || current;
-    takenOn = localDate(now);
+    let failed = false;
+    const text = await snapshot(config, now, () => { failed = true; warn(ctx); });
+    current = failed && current ? current : text;
+    takenOn = failed ? "" : localDate(now);
+    // Retry a failed read on a later turn, but not every turn while Pensieve is down.
+    retryAt = failed ? Date.now() + 60_000 : 0;
   };
 
   pi.on("session_start", async (_event, ctx) => {
     config = loadConfig();
     current = "";
     takenOn = "";
+    retryAt = 0;
     warned = false;
     if (!config) {
       if (ctx.hasUI) ctx.ui.notify("Pensieve not configured; memory disabled", "info");
@@ -151,7 +157,7 @@ export default function pensieve(pi: ExtensionAPI): void {
   });
   pi.on("session_compact", async (_event, ctx) => { await refresh(ctx); });
   pi.on("before_agent_start", async (event, ctx) => {
-    if (config && takenOn !== localDate(new Date())) await refresh(ctx);
+    if (config && takenOn !== localDate(new Date()) && Date.now() >= retryAt) await refresh(ctx);
     if (current) {
       event.systemPromptOptions.sections ??= {};
       event.systemPromptOptions.sections.pensieve = current;

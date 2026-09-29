@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { appendJournal, buildSnapshot, isNone, localDate, newJournal, openItems, resolveConfig } from "../index.ts";
+import pensieve, { appendJournal, buildSnapshot, isNone, localDate, newJournal, openItems, resolveConfig } from "../index.ts";
 
 test("Pensieve memory helpers", () => {
   const file = { mcpServers: { pensieve: {
@@ -34,4 +34,30 @@ test("Pensieve memory helpers", () => {
   assert.ok(isNone(" NONE \n"));
   assert.ok(isNone("\t"));
   assert.ok(!isNone("### Decisions\n- Choice"));
+});
+
+test("retries a failed snapshot on a later turn, at most once a minute", async t => {
+  process.env.PENSIEVE_URL = "http://pensieve.test/mcp";
+  process.env.PENSIEVE_TOKEN = "token-0123456789abcdef";
+  t.after(() => { delete process.env.PENSIEVE_URL; delete process.env.PENSIEVE_TOKEN; });
+  let up = false;
+  t.mock.method(globalThis, "fetch", async (url: string | URL | Request) => {
+    if (!up) throw new TypeError("fetch failed");
+    return String(url).endsWith("/mcp") ? Response.json({ result: { instructions: "guide" } }) : new Response(null, { status: 404 });
+  });
+  t.mock.timers.enable({ apis: ["Date"] });
+  const on: Record<string, Function> = {};
+  pensieve({ on: (name: string, handler: Function) => { on[name] = handler; } } as never);
+  const ctx = { hasUI: false };
+  const turn = async () => {
+    const event = { systemPromptOptions: {} as { sections?: Record<string, string> } };
+    await on.before_agent_start(event, ctx);
+    return event.systemPromptOptions.sections?.pensieve;
+  };
+  await on.session_start({}, ctx);
+  assert.equal(await turn(), undefined);
+  up = true;
+  assert.equal(await turn(), undefined);
+  t.mock.timers.tick(60_000);
+  assert.match(await turn() ?? "", /^guide\n\nShort-term memory/);
 });
