@@ -60,4 +60,9 @@ test("retries a failed snapshot on a later turn, at most once a minute", async t
   assert.equal(await turn(), undefined);
   t.mock.timers.tick(60_000);
   assert.match(await turn() ?? "", /^guide\n\nShort-term memory/);
+
+  const forced = { systemPrompt: "forced", systemPromptOptions: { forceSystemPrompt: "forced" } as { forceSystemPrompt?: string; sections?: Record<string, string> } };
+  const result = await on.before_agent_start(forced, ctx);
+  assert.match(result?.systemPrompt ?? "", /^forced\n\n<pensieve>\nguide\n/);
+  assert.equal(forced.systemPromptOptions.sections, undefined);
 });

@@ -158,10 +158,12 @@ export default function pensieve(pi: ExtensionAPI): void {
   pi.on("session_compact", async (_event, ctx) => { await refresh(ctx); });
   pi.on("before_agent_start", async (event, ctx) => {
     if (config && takenOn !== localDate(new Date()) && Date.now() >= retryAt) await refresh(ctx);
-    if (current) {
-      event.systemPromptOptions.sections ??= {};
-      event.systemPromptOptions.sections.pensieve = current;
-    }
+    if (!current) return;
+    const options = event.systemPromptOptions;
+    // Once an earlier extension replaces the whole prompt, Pi ignores section changes, so append to its text.
+    if (options.forceSystemPrompt !== undefined) return { systemPrompt: `${event.systemPrompt}\n\n<pensieve>\n${current}\n</pensieve>` };
+    options.sections ??= {};
+    options.sections.pensieve = current;
   });
   pi.on("session_shutdown", async (event, ctx) => {
     if (event.reason !== "quit" || !config || !ctx.hasUI) return;
