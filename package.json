@@ -1,20 +1,35 @@
 {
   "name": "@mipsel64/pi-pensieve",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Pensieve short-term memory for Pi",
   "type": "module",
   "license": "MIT",
-  "repository": { "type": "git", "url": "git+https://github.com/mipsel64/pi-pensieve.git" },
-  "publishConfig": { "access": "public" },
-  "files": ["index.ts"],
-  "keywords": ["pi-package"],
-  "pi": { "extensions": ["./index.ts"] },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/mipsel64/pi-pensieve.git"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "files": [
+    "index.ts"
+  ],
+  "keywords": [
+    "pi-package"
+  ],
+  "pi": {
+    "extensions": [
+      "./index.ts"
+    ]
+  },
   "scripts": {
     "check": "tsc",
     "test": "node --test --experimental-strip-types test/*.test.ts",
     "prepublishOnly": "npm run check && npm test"
   },
-  "engines": { "node": ">=22.19.0" },
+  "engines": {
+    "node": ">=22.19.0"
+  },
   "peerDependencies": {
     "@earendil-works/pi-ai": "*",
     "@earendil-works/pi-coding-agent": "*"
