@@ -1,16 +1,25 @@
-import { test } from "node:test";
+import { mock, test } from "node:test";
 import assert from "node:assert/strict";
 import childProcess from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { syncBuiltinESMExports } from "node:module";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import pensieve, { appendJournal, buildSnapshot, isNone, localDate, newJournal, openItems, resolveConfig } from "../index.ts";
+import pensieve, { appendJournal, buildSnapshot, capConversation, formatRecall, isNone, journalDelta, journalEntries, localDate, newJournal, openItems, resolveConfig } from "../index.ts";
 
 const agentDir = process.env.PI_CODING_AGENT_DIR = mkdtempSync(join(tmpdir(), "pi-pensieve-test-"));
+// Mocked once: Node does not re-sync the ESM binding of spawn after a second mock of it.
+const spawned: { args: string[]; options: { cwd: string; detached: boolean; env: NodeJS.ProcessEnv } }[] = [];
+mock.method(childProcess, "spawn", (_command: string, args: string[], options: never) => {
+  spawned.push({ args, options });
+  return { on() {}, unref() {} };
+});
+syncBuiltinESMExports();
+const transcriptOf = (i: number) => readFileSync(spawned[i]!.args.at(-1)!.slice(1), "utf8");
+const appended: { customType: string; data: unknown }[] = [];
 const load = () => {
   const on: Record<string, Function> = {};
-  pensieve({ on: (name: string, handler: Function) => { on[name] = handler; }, registerCommand() {} } as never);
+  pensieve({ on: (name: string, handler: Function) => { on[name] = handler; }, registerCommand() {}, appendEntry: (customType: string, data: unknown) => { appended.push({ customType, data }); } } as never);
   return on;
 };
 const writeSettings = (settings: object) => {
@@ -36,20 +45,111 @@ test("Pensieve memory helpers", () => {
   assert.equal(localDate(now), "2026-01-01");
   assert.equal(openItems("- [ ] first\n- [x] done\n  - [ ] second\n- [ ] third"), "- [ ] first\n  - [ ] second\n- [ ] third");
   assert.equal(openItems(`- [ ] ${"a".repeat(2100)}`).length, 2000);
-  const snapshot = buildSnapshot("guide", "---\ntype: journal\n---\n- [x] closed\n- [ ] open", "---\ntype: journal\n---\n" + "t".repeat(3100), "y".repeat(3200), now);
+  const entry = (time: string, project: string, text: string) => `\n## ${time} ${project} (abcdefgh)\n\n${text}\n`;
+  const snapshot = buildSnapshot("guide", "---\ntype: journal\n---\n- [x] closed\n- [ ] open", `---\ntype: journal\n---\n# Journal 2026-01-01\n${entry("08:00", "repo", "today entry")}`, `# Journal 2025-12-31\n${entry("22:00", "repo", "old entry")}`, now, "repo");
   assert.ok(snapshot.includes("guide\n\nShort-term memory"));
   assert.ok(snapshot.includes("Scratchpad (open items):\n- [ ] open"));
   assert.ok(!snapshot.includes("closed"));
-  assert.ok(snapshot.includes("Journal 2025-12-31:\n"));
-  assert.equal(snapshot.split("Journal 2026-01-01:\n")[1]?.split("\n\nJournal 2025")[0]?.length, 3000);
-  assert.equal(buildSnapshot("", "", "", "", now), "");
-  assert.equal(buildSnapshot("", "- [x] done", "", "", now), "");
+  assert.ok(snapshot.includes("Journal 2026-01-01:\n## 08:00 repo (abcdefgh)\n\ntoday entry"));
+  assert.ok(snapshot.includes("Journal 2025-12-31:\n## 22:00 repo (abcdefgh)\n\nold entry"));
+  assert.ok(!snapshot.includes("Not shown"));
+  assert.equal(buildSnapshot("", "", "", "", now, "repo"), "");
+  assert.equal(buildSnapshot("", "- [x] done", "", "", now, "repo"), "");
   assert.equal(newJournal("2026-01-01"), "---\ntype: journal\ntags: [journal]\n---\n# Journal 2026-01-01\n");
   assert.equal(appendJournal(newJournal("2026-01-01"), "### Decisions\n- Choice", now, "repo", "abcdefgh-123"),
     `${newJournal("2026-01-01")}\n## 09:05 repo (abcdefgh)\n\n### Decisions\n- Choice\n`);
   assert.ok(isNone(" NONE \n"));
   assert.ok(isNone("\t"));
   assert.ok(!isNone("### Decisions\n- Choice"));
+});
+
+test("journalEntries splits a journal body at ## headings", () => {
+  const content = `# Journal 2026-01-01\n\n## 08:00 my repo (abcdefgh)\n\n### Context\n- a\n\n## 09:30 other (12345678)\n\nb\n`;
+  assert.deepEqual(journalEntries(content), [
+    { heading: "08:00 my repo", project: "my repo", text: "## 08:00 my repo (abcdefgh)\n\n### Context\n- a" },
+    { heading: "09:30 other", project: "other", text: "## 09:30 other (12345678)\n\nb" },
+  ]);
+  assert.deepEqual(journalEntries("# Journal 2026-01-01\n"), []);
+  assert.equal(journalEntries("## 08:00 repo (abcdefgh)\r\n\r\nx\r\n")[0]?.project, "repo");
+});
+
+test("buildSnapshot shows the current project first, within 6000 characters, and lists the rest by heading", () => {
+  const now = new Date(2026, 0, 1, 12, 0);
+  const entry = (time: string, project: string, size: number) => `\n## ${time} ${project} (abcdefgh)\n\n${"x".repeat(size)}\n`;
+  const today = `# Journal 2026-01-01\n${entry("08:00", "other", 1900)}${entry("09:00", "repo", 1900)}${entry("10:00", "other", 1900)}${entry("11:00", "repo", 1900)}`;
+  const yesterday = `# Journal 2025-12-31\n${entry("20:00", "repo", 1900)}${entry("21:00", "other", 100)}`;
+  const snapshot = buildSnapshot("", "", today, yesterday, now, "repo");
+  // Order: repo today (11:00, 09:00), repo yesterday (20:00) = 3 entries of about 1940 characters; the next entry no longer fits, so the small 21:00 entry stays out too.
+  assert.ok(snapshot.includes("## 11:00 repo") && snapshot.includes("## 09:00 repo") && snapshot.includes("## 20:00 repo"));
+  assert.ok(!snapshot.includes("## 10:00 other") && !snapshot.includes("## 21:00 other"));
+  assert.ok(snapshot.indexOf("## 09:00 repo") < snapshot.indexOf("## 11:00 repo"));
+  assert.ok(snapshot.includes("Not shown (read Journal 2026-01-01): 08:00 other, 10:00 other"));
+  assert.ok(snapshot.includes("Not shown (read Journal 2025-12-31): 21:00 other"));
+
+  const fitting = buildSnapshot("", "", `# Journal 2026-01-01\n${entry("08:00", "other", 100)}`, "", now, "repo");
+  assert.ok(fitting.includes("## 08:00 other") && !fitting.includes("Not shown"));
+
+  const long = buildSnapshot("", "", `# Journal 2026-01-01\n${entry("08:00", "repo", 10)}${entry("09:00", "repo", 7000)}`, "", now, "repo");
+  const cut = long.split("Journal 2026-01-01:\n")[1]?.split("\n\nNot shown")[0] ?? "";
+  assert.equal(cut.length, 6000 + "\n… (cut; read Journal 2026-01-01)".length);
+  assert.ok(cut.endsWith("x\n… (cut; read Journal 2026-01-01)"));
+  assert.ok(!fitting.includes("(cut;"));
+  assert.ok(long.includes("## 09:00 repo") && !long.includes("## 08:00 repo"));
+  assert.ok(long.includes("Not shown (read Journal 2026-01-01): 08:00 repo"));
+  assert.ok(long.includes("saved to Journal YYYY-MM-DD pages automatically, during the session (after 10 idle minutes and before compaction) and when it ends"));
+  assert.ok(!long.includes("search skips journals") && !long.includes("Recall includes journal"));
+
+  const busy = buildSnapshot("", "", `# Journal 2026-01-01\n${entry("07:00", "repo", 6000)}${Array.from({ length: 25 }, (_, i) => entry(`08:${String(i).padStart(2, "0")}`, "other", 10)).join("")}`, "", now, "repo");
+  assert.ok(busy.includes("Not shown (read Journal 2026-01-01): 08:05 other, ") && busy.endsWith("08:24 other and 5 earlier"));
+
+  const late = buildSnapshot("", "", `# Journal 2026-01-01\n${entry("10:00", "repo", 3500)}${entry("09:00", "repo", 3500)}`, "", now, "repo");
+  assert.ok(late.includes("## 10:00 repo") && late.endsWith("Not shown (read Journal 2026-01-01): 09:00 repo"));
+});
+
+test("journalDelta returns the messages after the newest journal cursor on the branch", () => {
+  const message = (id: string, role = "user") => ({ type: "message", id, message: { role, content: "x" } }) as never;
+  const cursor = (id: string, entryId: string) => ({ type: "custom", id, customType: "pensieve-journal", data: { entryId } }) as never;
+  const other = { type: "custom", id: "o", customType: "other", data: { entryId: "1" } } as never;
+  const branch = [message("1"), message("2"), other, cursor("c1", "2"), message("3"), { type: "compaction", id: "k" } as never, message("4"), cursor("c2", "4"), message("5")];
+  assert.deepEqual(journalDelta(branch).lastId, "5");
+  assert.equal(journalDelta(branch).messages.length, 1);
+  assert.equal(journalDelta(branch.slice(0, 5)).messages.length, 1);
+  assert.equal(journalDelta(branch.slice(0, 7)).lastId, "4");
+  assert.equal(journalDelta(branch.slice(0, 7)).messages.length, 2);
+  assert.equal(journalDelta([message("1"), other, message("2")]).messages.length, 2);
+  assert.deepEqual(journalDelta([]), { messages: [], lastId: undefined, journaled: false });
+  assert.ok(journalDelta(branch).journaled && !journalDelta(branch.slice(0, 3)).journaled);
+  assert.equal(journalDelta([message("1"), cursor("c", "1")]).lastId, undefined);
+});
+
+test("journalDelta counts cursors on other /tree branches and capConversation keeps head and tail", () => {
+  const message = (id: string, parentId: string | null) => ({ type: "message", id, parentId, message: { role: "user", content: "x" } }) as never;
+  const cursor = (id: string, parentId: string, entryId: string) => ({ type: "custom", id, parentId, customType: "pensieve-journal", data: { entryId } }) as never;
+  // m1 - m2 - m3 - m4 (abandoned, journaled up to m4); the branch goes m1 - m2 - m5 - m6.
+  const all = [message("m1", null), message("m2", "m1"), message("m3", "m2"), message("m4", "m3"), cursor("c1", "m4", "m4"), message("m5", "m2"), message("m6", "m5")];
+  const branch = [all[0]!, all[1]!, all[5]!, all[6]!];
+  const delta = journalDelta(branch, all);
+  assert.deepEqual([delta.messages.length, delta.lastId, delta.journaled], [2, "m6", true]);
+  assert.equal(journalDelta(branch).messages.length, 4);
+  assert.equal(journalDelta(branch, [...all, cursor("c2", "m6", "gone")]).messages.length, 2);
+
+  const text = "a".repeat(20_000) + "b".repeat(30_000) + "c".repeat(60_000);
+  assert.equal(capConversation("short"), "short");
+  assert.equal(capConversation(text.slice(0, 80_000)), text.slice(0, 80_000));
+  const capped = capConversation(text);
+  assert.ok(capped.startsWith("a".repeat(20_000) + "\n\n[… middle of this part omitted …]\n\n"));
+  assert.ok(capped.endsWith("c".repeat(60_000)));
+  assert.equal(capped.length, 80_000 + "\n\n[… middle of this part omitted …]\n\n".length);
+});
+
+test("formatRecall lays passages out like the Pensieve recall tool", () => {
+  const passage = { title: "Page", heading: "Part", text: "body", rev: 3, updated_at: "2026-01-02T03:04:05Z", kind: "topic", confidence: "high", score: 0.5 };
+  assert.equal(formatRecall({ reranked: false, tokens: 40, passages: [], leads: ["Lead"] }), "");
+  assert.equal(
+    formatRecall({ reranked: false, tokens: 40, passages: [passage, { ...passage, heading: "", kind: null, confidence: null }], leads: ["A", "B"] }),
+    "2 passages from 1 pages (~40 tokens), ranked by BM25.\n\n## Page › Part\ntype topic · confidence high · rev 3 · updated 2026-01-02\nbody\n\n## Page\nrev 3 · updated 2026-01-02\nbody\n\nMore pages: A, B. Use read(title, section) for more.",
+  );
+  assert.match(formatRecall({ reranked: true, tokens: 9, passages: [passage], leads: [] }), /ranked by Jev relevance\.\n\n## Page › Part\ntype topic · confidence high · rev 3 · updated 2026-01-02 · relevance 0.50\nbody\n$/);
 });
 
 test("retries a failed snapshot on a later turn, at most once a minute", async t => {
@@ -63,9 +163,9 @@ test("retries a failed snapshot on a later turn, at most once a minute", async t
   });
   t.mock.timers.enable({ apis: ["Date"] });
   const on = load();
-  const ctx = { hasUI: false };
+  const ctx = { hasUI: false, cwd: "/work/repo" };
   const turn = async () => {
-    const event = { systemPromptOptions: {} as { sections?: Record<string, string> } };
+    const event = { prompt: "", systemPromptOptions: {} as { sections?: Record<string, string> } };
     await on.before_agent_start(event, ctx);
     return event.systemPromptOptions.sections?.pensieve;
   };
@@ -76,7 +176,7 @@ test("retries a failed snapshot on a later turn, at most once a minute", async t
   t.mock.timers.tick(60_000);
   assert.match(await turn() ?? "", /^guide\n\nShort-term memory/);
 
-  const forced = { systemPrompt: "forced", systemPromptOptions: { forceSystemPrompt: "forced" } as { forceSystemPrompt?: string; sections?: Record<string, string> } };
+  const forced = { prompt: "", systemPrompt: "forced", systemPromptOptions: { forceSystemPrompt: "forced" } as { forceSystemPrompt?: string; sections?: Record<string, string> } };
   const result = await on.before_agent_start(forced, ctx);
   assert.match(result?.systemPrompt ?? "", /^forced\n\n<pensieve>\nguide\n/);
   assert.equal(forced.systemPromptOptions.sections, undefined);
@@ -91,13 +191,7 @@ test("quitting hands the summary to a detached pi that appends it to the journal
     if (init?.method === "PUT") puts.push({ url: String(url), body: JSON.parse(String(init.body)) });
     return String(url).endsWith("/mcp") ? Response.json({ result: { instructions: "guide" } }) : new Response(null, { status: 404 });
   });
-  const spawned: { args: string[]; options: { cwd: string; detached: boolean; env: NodeJS.ProcessEnv } }[] = [];
-  t.mock.method(childProcess, "spawn", (_command: string, args: string[], options: never) => {
-    spawned.push({ args, options });
-    return { on() {}, unref() {} };
-  });
-  syncBuiltinESMExports();
-  t.after(() => { t.mock.restoreAll(); syncBuiltinESMExports(); });
+  spawned.length = 0;
 
   const message = (role: string, text: string) => ({ type: "message", message: { role, content: [{ type: "text", text }], stopReason: "stop", timestamp: 0 } });
   const branch = (...messages: ReturnType<typeof message>[]) => messages.map((entry, i) => ({ ...entry, id: String(i), parentId: i ? String(i - 1) : null }));
@@ -106,11 +200,12 @@ test("quitting hands the summary to a detached pi that appends it to the journal
   const ctx = {
     hasUI: true, cwd: "/work/repo", model: { provider: "p", id: "m" },
     modelRegistry: { find: (provider: string, id: string) => provider === "q" ? { provider, id } : undefined },
-    ui: { notify() {} }, sessionManager: { getBranch: () => entries, getSessionId: () => "abcdefgh-123" },
+    ui: { notify() {} }, sessionManager: { getBranch: () => entries, getEntries: () => entries, getSessionId: () => "abcdefgh-123" },
   };
   await on.session_start({}, ctx);
   await on.session_shutdown({ reason: "quit" }, ctx);
   assert.equal(spawned.length, 1);
+  assert.deepEqual(appended.at(-1), { customType: "pensieve-journal", data: { entryId: "3" } });
   const { args, options } = spawned[0]!;
   const job = JSON.parse(options.env.PI_PENSIEVE_JOB!);
   const transcript = join(job.dir, "conversation.md");
@@ -147,4 +242,216 @@ test("quitting hands the summary to a detached pi that appends it to the journal
   await off.session_start({}, ctx);
   await off.session_shutdown({ reason: "quit" }, ctx);
   assert.equal(spawned.length, 2);
+  writeSettings({});
+});
+
+const turns = (count: number, first = 0) => Array.from({ length: count }, (_, i) => ({
+  type: "message", id: `m${first + i}`, parentId: null,
+  message: { role: i % 2 ? "assistant" : "user", content: [{ type: "text", text: `turn ${first + i}` }], stopReason: "stop", timestamp: 0 },
+}));
+
+test("journals the part of the session after the cursor on idle, compaction and session change", async t => {
+  process.env.PENSIEVE_URL = "http://pensieve.test/mcp";
+  process.env.PENSIEVE_TOKEN = "token-0123456789abcdef";
+  t.after(() => { delete process.env.PENSIEVE_URL; delete process.env.PENSIEVE_TOKEN; });
+  t.mock.method(globalThis, "fetch", async (url: string | URL | Request) =>
+    String(url).endsWith("/mcp") ? Response.json({ result: { instructions: "guide" } }) : new Response(null, { status: 404 }));
+  spawned.length = 0;
+  const transcript = (i: number) => readFileSync(spawned[i]!.args.at(-1)!.slice(1), "utf8");
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+
+  const entries: unknown[] = turns(4);
+  const on: Record<string, Function> = {};
+  pensieve({
+    on: (name: string, handler: Function) => { on[name] = handler; }, registerCommand() {},
+    appendEntry: (customType: string, data: unknown) => { entries.push({ type: "custom", id: `c${entries.length}`, customType, data }); },
+  } as never);
+  const ctx = {
+    hasUI: true, cwd: "/work/repo", model: { provider: "p", id: "m" }, modelRegistry: { find: () => undefined }, ui: { notify() {} },
+    sessionManager: { getBranch: () => entries, getEntries: () => entries, getSessionId: () => "abcdefgh-123" },
+  };
+  await on.session_start({}, ctx);
+
+  on.agent_settled({}, ctx);
+  t.mock.timers.tick(9 * 60_000);
+  assert.equal(spawned.length, 0);
+  on.agent_settled({}, ctx);
+  t.mock.timers.tick(9 * 60_000);
+  assert.equal(spawned.length, 0);
+  t.mock.timers.tick(60_000);
+  assert.equal(spawned.length, 1);
+  assert.ok(transcript(0).includes("turn 0") && transcript(0).includes("turn 3"));
+  assert.deepEqual(entries.at(-1), { type: "custom", id: "c4", customType: "pensieve-journal", data: { entryId: "m3" } });
+
+  on.agent_settled({}, ctx);
+  t.mock.timers.tick(10 * 60_000);
+  assert.equal(spawned.length, 1);
+
+  entries.push(...turns(3, 4));
+  assert.equal(await on.session_before_compact({ reason: "threshold" }, ctx), undefined);
+  assert.equal(spawned.length, 1);
+  entries.push(...turns(1, 7));
+  on.session_before_compact({ reason: "manual" }, ctx);
+  assert.equal(spawned.length, 2);
+  assert.ok(!transcript(1).includes("turn 3") && transcript(1).includes("turn 4") && transcript(1).includes("turn 7"));
+
+  entries.push(...turns(4, 8));
+  on.agent_settled({}, ctx);
+  on.agent_start({}, ctx);
+  t.mock.timers.tick(10 * 60_000);
+  assert.equal(spawned.length, 2);
+  on.agent_settled({}, ctx);
+  await on.before_agent_start({ prompt: "next", systemPromptOptions: {} }, ctx);
+  t.mock.timers.tick(10 * 60_000);
+  assert.equal(spawned.length, 2);
+
+  on.agent_settled({}, ctx);
+  on.session_shutdown({ reason: "reload" }, ctx);
+  t.mock.timers.tick(10 * 60_000);
+  assert.equal(spawned.length, 2);
+  on.session_shutdown({ reason: "resume" }, ctx);
+  assert.equal(spawned.length, 3);
+  assert.ok(transcript(2).includes("turn 8") && !transcript(2).includes("turn 7"));
+  on.session_shutdown({ reason: "quit" }, ctx);
+  assert.equal(spawned.length, 3);
+  entries.push(...turns(2, 12));
+  on.session_before_compact({ reason: "manual" }, ctx);
+  assert.equal(spawned.length, 3);
+  on.session_shutdown({ reason: "quit" }, ctx);
+  assert.equal(spawned.length, 4);
+  assert.ok(transcript(3).includes("turn 12") && transcript(3).includes("turn 13"));
+  on.agent_settled({}, { ...ctx, hasUI: false });
+  t.mock.timers.tick(10 * 60_000);
+  assert.equal(spawned.length, 4);
+});
+
+test("a fork starts with a cursor, a reload does not recall again, and a down Pensieve keeps the delta", async t => {
+  process.env.PENSIEVE_URL = "http://pensieve.test/mcp";
+  process.env.PENSIEVE_TOKEN = "token-0123456789abcdef";
+  t.after(() => { delete process.env.PENSIEVE_URL; delete process.env.PENSIEVE_TOKEN; });
+  let up = true;
+  let recalls = 0;
+  t.mock.method(globalThis, "fetch", async (url: string | URL | Request) => {
+    if (!up) throw new TypeError("fetch failed");
+    if (String(url).includes("/api/recall")) {
+      recalls++;
+      return Response.json({ reranked: false, tokens: 1, passages: [{ title: "P", heading: "", text: "t", rev: 1, updated_at: "2026-01-01", score: 1 }], leads: [] });
+    }
+    return String(url).endsWith("/mcp") ? Response.json({ result: { instructions: "guide" } }) : new Response(null, { status: 404 });
+  });
+  spawned.length = 0;
+  const entries: unknown[] = turns(4);
+  const on: Record<string, Function> = {};
+  const appendedHere: { customType: string; data: unknown }[] = [];
+  pensieve({
+    on: (name: string, handler: Function) => { on[name] = handler; }, registerCommand() {},
+    appendEntry: (customType: string, data: unknown) => { appendedHere.push({ customType, data }); entries.push({ type: "custom", id: `c${entries.length}`, parentId: "m3", customType, data }); },
+  } as never);
+  const ctx = {
+    hasUI: true, cwd: "/work/repo", model: { provider: "p", id: "m" }, modelRegistry: { find: () => undefined }, ui: { notify() {} },
+    sessionManager: { getBranch: () => entries, getEntries: () => entries, getSessionId: () => "abcdefgh-123" },
+  };
+  await on.session_start({ reason: "startup" }, ctx);
+  assert.equal(appendedHere.length, 0);
+  await on.session_start({ reason: "fork" }, ctx);
+  assert.deepEqual(appendedHere, [{ customType: "pensieve-journal", data: { entryId: "m3" } }]);
+  // The copied messages count as journaled, so a checkpoint right after the fork has nothing to send.
+  on.session_before_compact({ reason: "manual" }, ctx);
+  assert.equal(spawned.length, 0);
+
+  await on.session_start({ reason: "reload" }, ctx);
+  await on.before_agent_start({ prompt: "hello", systemPromptOptions: {} }, ctx);
+  assert.equal(recalls, 0);
+  await on.session_start({ reason: "resume" }, ctx);
+  await on.before_agent_start({ prompt: "hello", systemPromptOptions: {} }, ctx);
+  assert.equal(recalls, 1);
+
+  entries.push(...turns(4, 4));
+  up = false;
+  await on.session_compact({}, ctx);
+  on.session_before_compact({ reason: "manual" }, ctx);
+  assert.equal(spawned.length, 0);
+  on.session_shutdown({ reason: "quit" }, ctx);
+  assert.equal(spawned.length, 1);
+  assert.ok(transcriptOf(0).includes("turn 4"));
+});
+
+test("the journal job retries a conflicting write three times", async t => {
+  process.env.PENSIEVE_URL = "http://pensieve.test/mcp";
+  process.env.PENSIEVE_TOKEN = "token-0123456789abcdef";
+  const time = Date.now();
+  process.env.PI_PENSIEVE_JOB = JSON.stringify({ dir: join(agentDir, "gone"), project: "repo", sessionId: "abcdefgh-123", time });
+  t.after(() => { delete process.env.PENSIEVE_URL; delete process.env.PENSIEVE_TOKEN; delete process.env.PI_PENSIEVE_JOB; });
+  let conflicts = 3;
+  const methods: string[] = [];
+  t.mock.method(globalThis, "fetch", async (_url: string | URL | Request, init?: RequestInit) => {
+    methods.push(init?.method ?? "GET");
+    return init?.method === "PUT" ? new Response(null, { status: conflicts-- > 0 ? 409 : 200 }) : new Response(null, { status: 404 });
+  });
+  const worker: Record<string, Function> = {};
+  pensieve({ on: (name: string, handler: Function) => { worker[name] = handler; } } as never);
+  const reply = { sessionManager: { getBranch: () => turns(2).map((entry, i) => i ? entry : { ...entry, message: { ...entry.message, role: "assistant" } }).reverse() } };
+  await worker.session_shutdown({ reason: "quit" }, reply);
+  assert.deepEqual(methods, ["GET", "PUT", "GET", "PUT", "GET", "PUT", "GET", "PUT"]);
+  conflicts = 4;
+  methods.length = 0;
+  await worker.session_shutdown({ reason: "quit" }, reply);
+  assert.equal(methods.filter(method => method === "PUT").length, 4);
+});
+
+test("recalls memory for the first prompt of a session and after compaction", async t => {
+  process.env.PENSIEVE_URL = "http://pensieve.test/mcp";
+  process.env.PENSIEVE_TOKEN = "token-0123456789abcdef";
+  t.after(() => { delete process.env.PENSIEVE_URL; delete process.env.PENSIEVE_TOKEN; });
+  const recalls: { url: URL; headers: Record<string, string>; signal?: AbortSignal | null }[] = [];
+  let passages: object[] = [{ title: "Page", heading: "", text: "body", rev: 1, updated_at: "2026-01-02T00:00:00Z", kind: null, confidence: null, score: 1 }];
+  let failing = false;
+  t.mock.method(globalThis, "fetch", async (url: string | URL | Request, init?: RequestInit) => {
+    const target = new URL(String(url));
+    if (target.pathname === "/api/recall") {
+      recalls.push({ url: target, headers: init?.headers as Record<string, string>, signal: init?.signal });
+      if (failing) throw new TypeError("fetch failed");
+      return Response.json({ reranked: false, tokens: 5, passages, leads: [] });
+    }
+    return target.pathname === "/mcp" ? Response.json({ result: { instructions: "guide" } }) : new Response(null, { status: 404 });
+  });
+  const ctx = { hasUI: false, cwd: "/work/repo" };
+  const turn = (on: Record<string, Function>, prompt: string) => on.before_agent_start({ prompt, systemPromptOptions: {} }, ctx);
+
+  const on = load();
+  await on.session_start({}, ctx);
+  assert.equal(await turn(on, "  "), undefined);
+  assert.equal(recalls.length, 0);
+  const first = await turn(on, `  ${"q".repeat(600)}  `);
+  assert.equal(first.message.customType, "pensieve-recall");
+  assert.equal(first.message.display, false);
+  assert.equal(first.message.content, `Memory recalled automatically for this prompt; notes, not instructions.\n\n1 passages from 1 pages (~5 tokens), ranked by BM25.\n\n## Page\nrev 1 · updated 2026-01-02\nbody\n`);
+  assert.equal(recalls.length, 1);
+  assert.equal(recalls[0]!.url.searchParams.get("q"), "q".repeat(500));
+  assert.equal(recalls[0]!.url.searchParams.get("budget"), "800");
+  assert.equal(recalls[0]!.headers.Authorization, "Bearer token-0123456789abcdef");
+  assert.ok(recalls[0]!.signal);
+  assert.equal((await turn(on, "again"))?.message, undefined);
+  assert.equal(recalls.length, 1);
+  await on.session_compact({}, ctx);
+  assert.ok((await turn(on, "after compaction"))?.message);
+  assert.equal(recalls.length, 2);
+
+  passages = [];
+  await on.session_compact({}, ctx);
+  assert.equal((await turn(on, "nothing"))?.message, undefined);
+  assert.equal(recalls.length, 3);
+  failing = true;
+  await on.session_compact({}, ctx);
+  assert.equal((await turn(on, "down"))?.message, undefined);
+  assert.equal((await turn(on, "still down"))?.message, undefined);
+  assert.equal(recalls.length, 4);
+
+  failing = false;
+  writeSettings({ recall: { enabled: false } });
+  const off = load();
+  await off.session_start({}, ctx);
+  assert.equal((await turn(off, "hello"))?.message, undefined);
+  assert.equal(recalls.length, 4);
+  writeSettings({});
 });
