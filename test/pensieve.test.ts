@@ -101,6 +101,9 @@ test("buildSnapshot shows the current project first, within 6000 characters, and
 
   const busy = buildSnapshot("", "", `# Journal 2026-01-01\n${entry("07:00", "repo", 6000)}${Array.from({ length: 25 }, (_, i) => entry(`08:${String(i).padStart(2, "0")}`, "other", 10)).join("")}`, "", now, "repo");
   assert.ok(busy.includes("Not shown (read Journal 2026-01-01): 08:05 other, ") && busy.endsWith("08:24 other and 5 earlier"));
+
+  const late = buildSnapshot("", "", `# Journal 2026-01-01\n${entry("10:00", "repo", 3500)}${entry("09:00", "repo", 3500)}`, "", now, "repo");
+  assert.ok(late.includes("## 10:00 repo") && late.endsWith("Not shown (read Journal 2026-01-01): 09:00 repo"));
 });
 
 test("journalDelta returns the messages after the newest journal cursor on the branch", () => {

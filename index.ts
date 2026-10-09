@@ -54,9 +54,11 @@ export function buildSnapshot(instructions: string, scratchpad: string, today: s
   if (![instructions, items, today, yesterday].some(Boolean)) return "";
   const previous = new Date(now);
   previous.setDate(previous.getDate() - 1);
+  // Detached jobs can finish out of order, so order by the checkpoint time in the heading.
+  const byTime = (entries: JournalEntry[]) => entries.sort((a, b) => a.heading.slice(0, 5).localeCompare(b.heading.slice(0, 5)));
   const days = [
-    { date: localDate(now), entries: journalEntries(body(today)) },
-    { date: localDate(previous), entries: journalEntries(body(yesterday)) },
+    { date: localDate(now), entries: byTime(journalEntries(body(today))) },
+    { date: localDate(previous), entries: byTime(journalEntries(body(yesterday))) },
   ];
   const newestFirst = days.flatMap(day => [...day.entries].reverse().map(entry => ({ entry, date: day.date })));
   const order = [...newestFirst.filter(({ entry }) => entry.project === project), ...newestFirst.filter(({ entry }) => entry.project !== project)];
