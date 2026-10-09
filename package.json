@@ -35,14 +35,14 @@
     "@earendil-works/pi-coding-agent": "*"
   },
   "devDependencies": {
-    "@earendil-works/pi-ai": "0.87.1",
-    "@earendil-works/pi-coding-agent": "0.87.1",
-    "@earendil-works/pi-tui": "0.87.1",
+    "@earendil-works/pi-ai": "1.1.0",
+    "@earendil-works/pi-coding-agent": "1.1.0",
+    "@earendil-works/pi-tui": "1.1.0",
     "@types/node": "^26.6.2",
     "jiti": "^2.7.0",
     "typescript": "^7.0.2"
   },
   "dependencies": {
-    "@aliou/pi-utils-settings": "^0.21.0"
+    "@aliou/pi-utils-settings": "^0.23.0"
   }
 }
