@@ -1,6 +1,6 @@
 {
   "name": "@mipsel64/pi-pensieve",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Pensieve short-term memory for Pi",
   "type": "module",
   "license": "MIT",
