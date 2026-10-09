@@ -57,14 +57,15 @@ export function buildSnapshot(instructions: string, scratchpad: string, today: s
     { date: localDate(now), entries: journalEntries(body(today)) },
     { date: localDate(previous), entries: journalEntries(body(yesterday)) },
   ];
-  const newestFirst = days.flatMap(day => [...day.entries].reverse());
-  const order = [...newestFirst.filter(entry => entry.project === project), ...newestFirst.filter(entry => entry.project !== project)];
+  const newestFirst = days.flatMap(day => [...day.entries].reverse().map(entry => ({ entry, date: day.date })));
+  const order = [...newestFirst.filter(({ entry }) => entry.project === project), ...newestFirst.filter(({ entry }) => entry.project !== project)];
   const texts = new Map<JournalEntry, string>();
   let left = journalBudget;
-  for (const entry of order) {
+  for (const { entry, date } of order) {
     if (entry.text.length > left && texts.size) break;
-    texts.set(entry, entry.text.slice(0, left));
-    left -= texts.get(entry)!.length;
+    const head = entry.text.slice(0, left);
+    texts.set(entry, head.length < entry.text.length ? `${head}\n… (cut; read Journal ${date})` : head);
+    left -= head.length;
   }
   const sections = days.flatMap(({ date, entries }) => {
     const parts = entries.filter(entry => texts.has(entry)).map(entry => texts.get(entry)!);
@@ -74,7 +75,7 @@ export function buildSnapshot(instructions: string, scratchpad: string, today: s
   });
   return [
     instructions,
-    `Short-term memory (snapshot taken at ${now.toLocaleString()}): Session summaries are saved to Journal YYYY-MM-DD pages automatically, during the session (after 10 idle minutes and before compaction) and when it ends. Keep things to come back to as - [ ] items on the Scratchpad page (type: journal; create it with pensieve_write if missing; tick - [x] or delete items when done via pensieve_edit). Durable decisions, preferences and lessons belong on regular pages. Recall includes journal pages from the last 7 days; search skips journals unless type "journal" is passed. Read the pages for the latest state.`,
+    `Short-term memory (snapshot taken at ${now.toLocaleString()}): Session summaries are saved to Journal YYYY-MM-DD pages automatically, during the session (after 10 idle minutes and before compaction) and when it ends. Keep things to come back to as - [ ] items on the Scratchpad page (type: journal; create it with pensieve_write if missing; tick - [x] or delete items when done via pensieve_edit). Durable decisions, preferences and lessons belong on regular pages. Read the pages for the latest state.`,
     items && `Scratchpad (open items):\n${items}`,
     ...sections,
   ].filter(Boolean).join("\n\n");
@@ -158,12 +159,32 @@ async function recall(config: Config, prompt: string): Promise<string> {
   return formatRecall(await response.json() as Recalled);
 }
 
-// The cursor is the newest 'pensieve-journal' entry on the branch; its entryId is the last message already journaled.
-export function journalDelta(branch: SessionEntry[]): { messages: SessionMessageEntry["message"][]; lastId?: string; journaled: boolean } {
-  const cursor = branch.filter(entry => entry.type === "custom" && entry.customType === "pensieve-journal").at(-1);
-  const after = cursor?.type === "custom" ? (cursor.data as { entryId?: string } | undefined)?.entryId : undefined;
-  const fresh = branch.slice(after ? branch.findIndex(entry => entry.id === after) + 1 : 0).filter(entry => entry.type === "message");
-  return { messages: fresh.map(entry => entry.message), lastId: fresh.at(-1)?.id, journaled: cursor !== undefined };
+// A message is journaled when it is an ancestor-or-self of the entryId of any 'pensieve-journal' entry in the session, so cursors on other /tree branches count too.
+export function journalDelta(branch: SessionEntry[], entries: SessionEntry[] = branch): { messages: SessionMessageEntry["message"][]; lastId?: string; journaled: boolean } {
+  const byId = new Map(entries.map(entry => [entry.id, entry]));
+  const position = new Map(branch.map((entry, index) => [entry.id, index]));
+  let done = -1;
+  for (const cursor of entries) {
+    if (cursor.type !== "custom" || cursor.customType !== "pensieve-journal") continue;
+    for (let id = (cursor.data as { entryId?: string } | undefined)?.entryId, steps = 0; id && steps <= byId.size; steps++) {
+      const index = position.get(id);
+      if (index !== undefined) {
+        done = Math.max(done, index);
+        break;
+      }
+      id = byId.get(id)?.parentId ?? undefined;
+    }
+  }
+  const fresh = branch.slice(done + 1).filter(entry => entry.type === "message");
+  return { messages: fresh.map(entry => entry.message), lastId: fresh.at(-1)?.id, journaled: done >= 0 };
+}
+
+const conversationHead = 20_000;
+const conversationTail = 60_000;
+
+export function capConversation(text: string): string {
+  if (text.length <= conversationHead + conversationTail) return text;
+  return `${text.slice(0, conversationHead)}\n\n[… middle of this part omitted …]\n\n${text.slice(-conversationTail)}`;
 }
 
 async function saveSummary(config: Config, summary: string, now: Date, project: string, sessionId: string, signal: AbortSignal): Promise<void> {
@@ -277,14 +298,15 @@ export default function pensieve(pi: ExtensionAPI): void {
     let dir: string | undefined;
     try {
       const { enabled, model: spec, thinking } = settings.getConfig().journal;
-      if (!enabled) return;
-      const { messages, lastId, journaled } = journalDelta(ctx.sessionManager.getBranch());
+      // While Pensieve is down the job could not save, so keep the delta for a later trigger.
+      if (!enabled || (!final && retryAt > Date.now())) return;
+      const { messages, lastId, journaled } = journalDelta(ctx.sessionManager.getBranch(), ctx.sessionManager.getEntries());
       // The last exchange after an earlier checkpoint is too short for the usual four messages but still worth keeping.
       if (messages.length < (final && journaled ? 2 : 4) || !lastId) return;
       const slash = spec.indexOf("/");
       const model = (slash > 0 ? ctx.modelRegistry.find(spec.slice(0, slash), spec.slice(slash + 1)) : undefined) ?? ctx.model;
       if (!model) return;
-      const conversation = serializeConversation(convertToLlm(messages)).slice(-80000).replaceAll("</conversation>", "<\\/conversation>");
+      const conversation = capConversation(serializeConversation(convertToLlm(messages))).replaceAll("</conversation>", "<\\/conversation>");
       if (!conversation.trim()) return;
       dir = mkdtempSync(join(tmpdir(), "pi-pensieve-"));
       const transcript = join(dir, "conversation.md");
@@ -307,7 +329,7 @@ export default function pensieve(pi: ExtensionAPI): void {
     }
   };
 
-  pi.on("session_start", async (_event, ctx) => {
+  pi.on("session_start", async (event, ctx) => {
     await settings.load();
     models = () => ctx.modelRegistry.getAvailable().map(model => `${model.provider}/${model.id}`);
     config = loadConfig();
@@ -315,10 +337,15 @@ export default function pensieve(pi: ExtensionAPI): void {
     takenOn = "";
     retryAt = 0;
     warned = false;
-    recallPending = Boolean(config);
+    recallPending = Boolean(config) && event.reason !== "reload";
     if (!config) {
       if (ctx.hasUI) ctx.ui.notify("Pensieve not configured; memory disabled", "info");
       return;
+    }
+    if (event.reason === "fork") {
+      // The old session journaled everything up to the fork point when it shut down.
+      const lastId = journalDelta(ctx.sessionManager.getBranch(), ctx.sessionManager.getEntries()).lastId;
+      if (lastId) pi.appendEntry("pensieve-journal", { entryId: lastId });
     }
     await refresh(ctx);
   });
@@ -346,7 +373,9 @@ export default function pensieve(pi: ExtensionAPI): void {
     }
     return message || systemPrompt ? { message, systemPrompt } : undefined;
   });
-  pi.on("agent_end", (_event, ctx) => {
+  pi.on("agent_start", () => { clearTimeout(idleTimer); });
+  // agent_settled comes only when no retry, compaction or queued turn follows.
+  pi.on("agent_settled", (_event, ctx) => {
     clearTimeout(idleTimer);
     if (!config || !ctx.hasUI) return;
     idleTimer = setTimeout(() => checkpoint(ctx), 10 * 60_000);

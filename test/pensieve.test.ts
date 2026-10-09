@@ -5,7 +5,7 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 
 import { syncBuiltinESMExports } from "node:module";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import pensieve, { appendJournal, buildSnapshot, formatRecall, isNone, journalDelta, journalEntries, localDate, newJournal, openItems, resolveConfig } from "../index.ts";
+import pensieve, { appendJournal, buildSnapshot, capConversation, formatRecall, isNone, journalDelta, journalEntries, localDate, newJournal, openItems, resolveConfig } from "../index.ts";
 
 const agentDir = process.env.PI_CODING_AGENT_DIR = mkdtempSync(join(tmpdir(), "pi-pensieve-test-"));
 // Mocked once: Node does not re-sync the ESM binding of spawn after a second mock of it.
@@ -15,6 +15,7 @@ mock.method(childProcess, "spawn", (_command: string, args: string[], options: n
   return { on() {}, unref() {} };
 });
 syncBuiltinESMExports();
+const transcriptOf = (i: number) => readFileSync(spawned[i]!.args.at(-1)!.slice(1), "utf8");
 const appended: { customType: string; data: unknown }[] = [];
 const load = () => {
   const on: Record<string, Function> = {};
@@ -89,10 +90,14 @@ test("buildSnapshot shows the current project first, within 6000 characters, and
   assert.ok(fitting.includes("## 08:00 other") && !fitting.includes("Not shown"));
 
   const long = buildSnapshot("", "", `# Journal 2026-01-01\n${entry("08:00", "repo", 10)}${entry("09:00", "repo", 7000)}`, "", now, "repo");
-  assert.equal(long.split("Journal 2026-01-01:\n")[1]?.split("\n\nNot shown")[0]?.length, 6000);
+  const cut = long.split("Journal 2026-01-01:\n")[1]?.split("\n\nNot shown")[0] ?? "";
+  assert.equal(cut.length, 6000 + "\n… (cut; read Journal 2026-01-01)".length);
+  assert.ok(cut.endsWith("x\n… (cut; read Journal 2026-01-01)"));
+  assert.ok(!fitting.includes("(cut;"));
   assert.ok(long.includes("## 09:00 repo") && !long.includes("## 08:00 repo"));
   assert.ok(long.includes("Not shown (read Journal 2026-01-01): 08:00 repo"));
   assert.ok(long.includes("saved to Journal YYYY-MM-DD pages automatically, during the session (after 10 idle minutes and before compaction) and when it ends"));
+  assert.ok(!long.includes("search skips journals") && !long.includes("Recall includes journal"));
 });
 
 test("journalDelta returns the messages after the newest journal cursor on the branch", () => {
@@ -109,6 +114,26 @@ test("journalDelta returns the messages after the newest journal cursor on the b
   assert.deepEqual(journalDelta([]), { messages: [], lastId: undefined, journaled: false });
   assert.ok(journalDelta(branch).journaled && !journalDelta(branch.slice(0, 3)).journaled);
   assert.equal(journalDelta([message("1"), cursor("c", "1")]).lastId, undefined);
+});
+
+test("journalDelta counts cursors on other /tree branches and capConversation keeps head and tail", () => {
+  const message = (id: string, parentId: string | null) => ({ type: "message", id, parentId, message: { role: "user", content: "x" } }) as never;
+  const cursor = (id: string, parentId: string, entryId: string) => ({ type: "custom", id, parentId, customType: "pensieve-journal", data: { entryId } }) as never;
+  // m1 - m2 - m3 - m4 (abandoned, journaled up to m4); the branch goes m1 - m2 - m5 - m6.
+  const all = [message("m1", null), message("m2", "m1"), message("m3", "m2"), message("m4", "m3"), cursor("c1", "m4", "m4"), message("m5", "m2"), message("m6", "m5")];
+  const branch = [all[0]!, all[1]!, all[5]!, all[6]!];
+  const delta = journalDelta(branch, all);
+  assert.deepEqual([delta.messages.length, delta.lastId, delta.journaled], [2, "m6", true]);
+  assert.equal(journalDelta(branch).messages.length, 4);
+  assert.equal(journalDelta(branch, [...all, cursor("c2", "m6", "gone")]).messages.length, 2);
+
+  const text = "a".repeat(20_000) + "b".repeat(30_000) + "c".repeat(60_000);
+  assert.equal(capConversation("short"), "short");
+  assert.equal(capConversation(text.slice(0, 80_000)), text.slice(0, 80_000));
+  const capped = capConversation(text);
+  assert.ok(capped.startsWith("a".repeat(20_000) + "\n\n[… middle of this part omitted …]\n\n"));
+  assert.ok(capped.endsWith("c".repeat(60_000)));
+  assert.equal(capped.length, 80_000 + "\n\n[… middle of this part omitted …]\n\n".length);
 });
 
 test("formatRecall lays passages out like the Pensieve recall tool", () => {
@@ -169,7 +194,7 @@ test("quitting hands the summary to a detached pi that appends it to the journal
   const ctx = {
     hasUI: true, cwd: "/work/repo", model: { provider: "p", id: "m" },
     modelRegistry: { find: (provider: string, id: string) => provider === "q" ? { provider, id } : undefined },
-    ui: { notify() {} }, sessionManager: { getBranch: () => entries, getSessionId: () => "abcdefgh-123" },
+    ui: { notify() {} }, sessionManager: { getBranch: () => entries, getEntries: () => entries, getSessionId: () => "abcdefgh-123" },
   };
   await on.session_start({}, ctx);
   await on.session_shutdown({ reason: "quit" }, ctx);
@@ -237,14 +262,14 @@ test("journals the part of the session after the cursor on idle, compaction and 
   } as never);
   const ctx = {
     hasUI: true, cwd: "/work/repo", model: { provider: "p", id: "m" }, modelRegistry: { find: () => undefined }, ui: { notify() {} },
-    sessionManager: { getBranch: () => entries, getSessionId: () => "abcdefgh-123" },
+    sessionManager: { getBranch: () => entries, getEntries: () => entries, getSessionId: () => "abcdefgh-123" },
   };
   await on.session_start({}, ctx);
 
-  on.agent_end({}, ctx);
+  on.agent_settled({}, ctx);
   t.mock.timers.tick(9 * 60_000);
   assert.equal(spawned.length, 0);
-  on.agent_end({}, ctx);
+  on.agent_settled({}, ctx);
   t.mock.timers.tick(9 * 60_000);
   assert.equal(spawned.length, 0);
   t.mock.timers.tick(60_000);
@@ -252,7 +277,7 @@ test("journals the part of the session after the cursor on idle, compaction and 
   assert.ok(transcript(0).includes("turn 0") && transcript(0).includes("turn 3"));
   assert.deepEqual(entries.at(-1), { type: "custom", id: "c4", customType: "pensieve-journal", data: { entryId: "m3" } });
 
-  on.agent_end({}, ctx);
+  on.agent_settled({}, ctx);
   t.mock.timers.tick(10 * 60_000);
   assert.equal(spawned.length, 1);
 
@@ -265,12 +290,16 @@ test("journals the part of the session after the cursor on idle, compaction and 
   assert.ok(!transcript(1).includes("turn 3") && transcript(1).includes("turn 4") && transcript(1).includes("turn 7"));
 
   entries.push(...turns(4, 8));
-  on.agent_end({}, ctx);
+  on.agent_settled({}, ctx);
+  on.agent_start({}, ctx);
+  t.mock.timers.tick(10 * 60_000);
+  assert.equal(spawned.length, 2);
+  on.agent_settled({}, ctx);
   await on.before_agent_start({ prompt: "next", systemPromptOptions: {} }, ctx);
   t.mock.timers.tick(10 * 60_000);
   assert.equal(spawned.length, 2);
 
-  on.agent_end({}, ctx);
+  on.agent_settled({}, ctx);
   on.session_shutdown({ reason: "reload" }, ctx);
   t.mock.timers.tick(10 * 60_000);
   assert.equal(spawned.length, 2);
@@ -285,9 +314,60 @@ test("journals the part of the session after the cursor on idle, compaction and 
   on.session_shutdown({ reason: "quit" }, ctx);
   assert.equal(spawned.length, 4);
   assert.ok(transcript(3).includes("turn 12") && transcript(3).includes("turn 13"));
-  on.agent_end({}, { ...ctx, hasUI: false });
+  on.agent_settled({}, { ...ctx, hasUI: false });
   t.mock.timers.tick(10 * 60_000);
   assert.equal(spawned.length, 4);
+});
+
+test("a fork starts with a cursor, a reload does not recall again, and a down Pensieve keeps the delta", async t => {
+  process.env.PENSIEVE_URL = "http://pensieve.test/mcp";
+  process.env.PENSIEVE_TOKEN = "token-0123456789abcdef";
+  t.after(() => { delete process.env.PENSIEVE_URL; delete process.env.PENSIEVE_TOKEN; });
+  let up = true;
+  let recalls = 0;
+  t.mock.method(globalThis, "fetch", async (url: string | URL | Request) => {
+    if (!up) throw new TypeError("fetch failed");
+    if (String(url).includes("/api/recall")) {
+      recalls++;
+      return Response.json({ reranked: false, tokens: 1, passages: [{ title: "P", heading: "", text: "t", rev: 1, updated_at: "2026-01-01", score: 1 }], leads: [] });
+    }
+    return String(url).endsWith("/mcp") ? Response.json({ result: { instructions: "guide" } }) : new Response(null, { status: 404 });
+  });
+  spawned.length = 0;
+  const entries: unknown[] = turns(4);
+  const on: Record<string, Function> = {};
+  const appendedHere: { customType: string; data: unknown }[] = [];
+  pensieve({
+    on: (name: string, handler: Function) => { on[name] = handler; }, registerCommand() {},
+    appendEntry: (customType: string, data: unknown) => { appendedHere.push({ customType, data }); entries.push({ type: "custom", id: `c${entries.length}`, parentId: "m3", customType, data }); },
+  } as never);
+  const ctx = {
+    hasUI: true, cwd: "/work/repo", model: { provider: "p", id: "m" }, modelRegistry: { find: () => undefined }, ui: { notify() {} },
+    sessionManager: { getBranch: () => entries, getEntries: () => entries, getSessionId: () => "abcdefgh-123" },
+  };
+  await on.session_start({ reason: "startup" }, ctx);
+  assert.equal(appendedHere.length, 0);
+  await on.session_start({ reason: "fork" }, ctx);
+  assert.deepEqual(appendedHere, [{ customType: "pensieve-journal", data: { entryId: "m3" } }]);
+  // The copied messages count as journaled, so a checkpoint right after the fork has nothing to send.
+  on.session_before_compact({ reason: "manual" }, ctx);
+  assert.equal(spawned.length, 0);
+
+  await on.session_start({ reason: "reload" }, ctx);
+  await on.before_agent_start({ prompt: "hello", systemPromptOptions: {} }, ctx);
+  assert.equal(recalls, 0);
+  await on.session_start({ reason: "resume" }, ctx);
+  await on.before_agent_start({ prompt: "hello", systemPromptOptions: {} }, ctx);
+  assert.equal(recalls, 1);
+
+  entries.push(...turns(4, 4));
+  up = false;
+  await on.session_compact({}, ctx);
+  on.session_before_compact({ reason: "manual" }, ctx);
+  assert.equal(spawned.length, 0);
+  on.session_shutdown({ reason: "quit" }, ctx);
+  assert.equal(spawned.length, 1);
+  assert.ok(transcriptOf(0).includes("turn 4"));
 });
 
 test("the journal job retries a conflicting write three times", async t => {
