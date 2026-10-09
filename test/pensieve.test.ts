@@ -98,6 +98,9 @@ test("buildSnapshot shows the current project first, within 6000 characters, and
   assert.ok(long.includes("Not shown (read Journal 2026-01-01): 08:00 repo"));
   assert.ok(long.includes("saved to Journal YYYY-MM-DD pages automatically, during the session (after 10 idle minutes and before compaction) and when it ends"));
   assert.ok(!long.includes("search skips journals") && !long.includes("Recall includes journal"));
+
+  const busy = buildSnapshot("", "", `# Journal 2026-01-01\n${entry("07:00", "repo", 6000)}${Array.from({ length: 25 }, (_, i) => entry(`08:${String(i).padStart(2, "0")}`, "other", 10)).join("")}`, "", now, "repo");
+  assert.ok(busy.includes("Not shown (read Journal 2026-01-01): 08:05 other, ") && busy.endsWith("08:24 other and 5 earlier"));
 });
 
 test("journalDelta returns the messages after the newest journal cursor on the branch", () => {

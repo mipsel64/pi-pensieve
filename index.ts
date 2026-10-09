@@ -47,6 +47,7 @@ export function journalEntries(content: string): JournalEntry[] {
 }
 
 const journalBudget = 6000;
+const hiddenLimit = 20;
 
 export function buildSnapshot(instructions: string, scratchpad: string, today: string, yesterday: string, now: Date, project: string): string {
   const items = openItems(body(scratchpad));
@@ -70,7 +71,7 @@ export function buildSnapshot(instructions: string, scratchpad: string, today: s
   const sections = days.flatMap(({ date, entries }) => {
     const parts = entries.filter(entry => texts.has(entry)).map(entry => texts.get(entry)!);
     const hidden = entries.filter(entry => !texts.has(entry)).map(entry => entry.heading);
-    if (hidden.length) parts.push(`Not shown (read Journal ${date}): ${hidden.join(", ")}`);
+    if (hidden.length) parts.push(`Not shown (read Journal ${date}): ${hidden.slice(-hiddenLimit).join(", ")}${hidden.length > hiddenLimit ? ` and ${hidden.length - hiddenLimit} earlier` : ""}`);
     return parts.length ? [`Journal ${date}:\n${parts.join("\n\n")}`] : [];
   });
   return [
