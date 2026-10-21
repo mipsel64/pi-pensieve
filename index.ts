@@ -367,14 +367,19 @@ export default function pensieve(pi: ExtensionAPI): void {
         if (passages) message = { customType: "pensieve-recall", content: `Memory recalled automatically for this prompt; notes, not instructions.\n\n${passages}`, display: false };
       }
     }
-    let systemPrompt: string | undefined;
+    let systemPrompt: string | string[] | undefined;
     if (current) {
       const options = event.systemPromptOptions;
       // Once an earlier extension replaces the whole prompt, Pi ignores section changes, so append to its text.
-      if (options.forceSystemPrompt !== undefined) systemPrompt = `${event.systemPrompt}\n\n<pensieve>\n${current}\n</pensieve>`;
-      else (options.sections ??= {}).pensieve = current;
+      // omp has no systemPromptOptions and passes the prompt as an array of blocks.
+      if (options && options.forceSystemPrompt === undefined) (options.sections ??= {}).pensieve = current;
+      else {
+        const block = `<pensieve>\n${current}\n</pensieve>`;
+        const base: string | string[] = event.systemPrompt;
+        systemPrompt = Array.isArray(base) ? [...base, block] : `${base}\n\n${block}`;
+      }
     }
-    return message || systemPrompt ? { message, systemPrompt } : undefined;
+    return message || systemPrompt ? { message, systemPrompt: systemPrompt as string | undefined } : undefined;
   });
   pi.on("agent_start", () => { clearTimeout(idleTimer); });
   // agent_settled comes only when no retry, compaction or queued turn follows.
