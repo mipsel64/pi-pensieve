@@ -180,6 +180,11 @@ test("retries a failed snapshot on a later turn, at most once a minute", async t
   const result = await on.before_agent_start(forced, ctx);
   assert.match(result?.systemPrompt ?? "", /^forced\n\n<pensieve>\nguide\n/);
   assert.equal(forced.systemPromptOptions.sections, undefined);
+
+  const ompArray = (await on.before_agent_start({ prompt: "", systemPrompt: ["base"] }, ctx))?.systemPrompt as unknown as string[];
+  assert.equal(ompArray[0], "base");
+  assert.match(ompArray[1]!, /^<pensieve>\nguide\n/);
+  assert.match((await on.before_agent_start({ prompt: "", systemPrompt: "base" }, ctx))?.systemPrompt ?? "", /^base\n\n<pensieve>\nguide\n/);
 });
 
 test("quitting hands the summary to a detached pi that appends it to the journal", async t => {
