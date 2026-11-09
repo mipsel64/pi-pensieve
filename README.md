@@ -31,7 +31,9 @@ It replaces [pi-memory](https://github.com/jayzeng/pi-memory)'s local daily logs
    }
    ```
 
-   `bearerToken` holds a literal token instead. Setting both `PENSIEVE_URL` and `PENSIEVE_TOKEN` overrides the file.
+   `bearerToken` holds a literal token instead. Setting both `PENSIEVE_URL` and `PENSIEVE_TOKEN` overrides the file. Pi continues to use this bearer authentication.
+
+   In omp, the plugin reads the `pensieve` entry from omp's agent `mcp.json` first and reuses omp's own OAuth sign-in to Pensieve through `omp token`. No separate Pensieve token is needed. The Pensieve server must accept OAuth access tokens on `/api`. A static bearer in the entry is only a fallback when omp has no OAuth token.
 3. Install the extension and restart Pi:
 
    ```sh

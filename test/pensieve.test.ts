@@ -1,11 +1,11 @@
 import { mock, test } from "node:test";
 import assert from "node:assert/strict";
 import childProcess from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { syncBuiltinESMExports } from "node:module";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import pensieve, { appendJournal, buildSnapshot, capConversation, formatRecall, isNone, journalDelta, journalEntries, localDate, newJournal, openItems, resolveConfig } from "../index.ts";
+import pensieve, { appendJournal, authorizedFetch, buildSnapshot, capConversation, type Config, detectHost, formatRecall, isNone, journalDelta, journalEntries, localDate, newJournal, ompProvider, openItems, resolveConfig, tokenSource } from "../index.ts";
 
 const agentDir = process.env.PI_CODING_AGENT_DIR = mkdtempSync(join(tmpdir(), "pi-pensieve-test-"));
 // Mocked once: Node does not re-sync the ESM binding of spawn after a second mock of it.
@@ -17,9 +17,9 @@ mock.method(childProcess, "spawn", (_command: string, args: string[], options: n
 syncBuiltinESMExports();
 const transcriptOf = (i: number) => readFileSync(spawned[i]!.args.at(-1)!.slice(1), "utf8");
 const appended: { customType: string; data: unknown }[] = [];
-const load = () => {
+const load = (deps?: { host?: "omp" | "pi"; runner?: (provider: string) => Promise<string | undefined> }) => {
   const on: Record<string, Function> = {};
-  pensieve({ on: (name: string, handler: Function) => { on[name] = handler; }, registerCommand() {}, appendEntry: (customType: string, data: unknown) => { appended.push({ customType, data }); } } as never);
+  pensieve({ on: (name: string, handler: Function) => { on[name] = handler; }, registerCommand() {}, appendEntry: (customType: string, data: unknown) => { appended.push({ customType, data }); } } as never, deps);
   return on;
 };
 const writeSettings = (settings: object) => {
@@ -27,19 +27,182 @@ const writeSettings = (settings: object) => {
   writeFileSync(join(agentDir, "extensions/pensieve.json"), JSON.stringify(settings));
 };
 
+test("detectHost identifies omp without executing the host", () => {
+  assert.equal(detectHost("/opt/homebrew/lib/node_modules/@oh-my-pi/pi-coding-agent/dist/cli.js", "/opt/homebrew/bin/node"), "omp");
+  assert.equal(detectHost("C:\\Users\\me\\AppData\\Roaming\\npm\\node_modules\\@oh-my-pi\\pi-coding-agent\\dist\\cli.js", "C:\\Program Files\\nodejs\\node.exe"), "omp");
+  assert.equal(detectHost("/$bunfs/omp", "/opt/homebrew/bin/omp"), "omp");
+  assert.equal(detectHost("B:\\~BUN\\omp.exe", "C:\\tools\\omp.exe"), "omp");
+  assert.equal(detectHost("/opt/homebrew/lib/node_modules/@earendil-works/pi-coding-agent/dist/cli.js", "/opt/homebrew/bin/node"), "pi");
+  assert.equal(detectHost("/$bunfs/pi", "/opt/homebrew/bin/pi"), "pi");
+  assert.equal(detectHost(undefined, "/opt/homebrew/bin/node"), "pi");
+});
+
+test("ompProvider follows omp profile normalization and preserves the URL", () => {
+  const url = "https://memory.example/mcp";
+  assert.equal(ompProvider(url, {}), `mcp_oauth:profile:default:${url}`);
+  assert.equal(ompProvider(url, { OMP_PROFILE: "work" }), `mcp_oauth:profile:work:${url}`);
+  assert.equal(ompProvider(url, { OMP_PROFILE: "", PI_PROFILE: "work" }), `mcp_oauth:profile:default:${url}`);
+  assert.equal(ompProvider(url, { PI_PROFILE: "work" }), `mcp_oauth:profile:work:${url}`);
+  assert.equal(ompProvider(url, { OMP_PROFILE: " default " }), `mcp_oauth:profile:default:${url}`);
+  assert.equal(ompProvider(`${url}/`, {}), `mcp_oauth:profile:default:${url}/`);
+});
+
+test("resolveConfig selects the host entry and keeps credentials out of headers", () => {
+  const omp = { mcpServers: { pensieve: {
+    url: "https://omp.example/mcp/", bearerToken: "stale-token",
+    headers: { "X-Pensieve-Agent": "omp", "X-Custom": "yes", Authorization: "Bearer stale-token", aUtHoRiZaTiOn: "Bearer duplicate" },
+  } } };
+  const mcp = { mcpServers: { pensieve: {
+    url: "https://pi.example/mcp", bearerTokenEnv: "PI_TOKEN", headers: { "X-Pensieve-Agent": "pi-custom", authorization: "Bearer file-token" },
+  } } };
+  const resolved = resolveConfig({}, { omp, mcp }, "omp");
+  assert.deepEqual(resolved, {
+    base: "https://omp.example",
+    headers: { "X-Pensieve-Agent": "omp", "X-Custom": "yes" },
+    auth: { kind: "omp", provider: "mcp_oauth:profile:default:https://omp.example/mcp/", fallback: "stale-token" },
+  });
+  assert.deepEqual(resolveConfig({ PI_TOKEN: "pi-token" }, { omp, mcp }, "pi"), {
+    base: "https://pi.example",
+    headers: { "X-Pensieve-Agent": "pi-custom" },
+    auth: { kind: "bearer", token: "pi-token" },
+  });
+  assert.equal(resolveConfig({}, { omp }, "pi"), undefined);
+  assert.ok(!Object.keys(resolved!.headers).some(name => name.toLowerCase() === "authorization"));
+});
+
+test("tokenSource caches success for 240000 ms and does not cache failure", async () => {
+  let now = 1_000;
+  let calls = 0;
+  const source = tokenSource({ kind: "omp", provider: "provider" }, async () => `oauth-${++calls}`, () => now);
+  assert.equal(await source.get(), "oauth-1");
+  now += 239_999;
+  assert.equal(await source.get(), "oauth-1");
+  assert.equal(calls, 1);
+  now += 1;
+  assert.equal(await source.get(), "oauth-2");
+  assert.equal(calls, 2);
+
+  const results = [undefined, "recovered"];
+  let failures = 0;
+  const recovering = tokenSource({ kind: "omp", provider: "provider" }, async () => results[failures++], () => now);
+  assert.equal(await recovering.get(), undefined);
+  assert.equal(await recovering.get(), "recovered");
+  assert.equal(await recovering.get(), "recovered");
+  assert.equal(failures, 2);
+});
+
+test("tokenSource uses fallback after failure and never runs for bearer auth", async () => {
+  let calls = 0;
+  const fallback = tokenSource({ kind: "omp", provider: "provider", fallback: "static-token" }, async () => { calls++; return undefined; });
+  assert.equal(await fallback.get(), "static-token");
+  assert.equal(await fallback.get(), "static-token");
+  assert.equal(calls, 2);
+
+  const bearer = tokenSource({ kind: "bearer", token: "bearer-token" }, async () => { calls++; return "oauth-token"; });
+  assert.equal(await bearer.get(), "bearer-token");
+  assert.equal(await bearer.get(), "bearer-token");
+  assert.equal(calls, 2);
+});
+
+test("tokenSource shares concurrent calls and invalidate rejects stale cache fills", async () => {
+  const pending = Promise.withResolvers<string>();
+  let calls = 0;
+  const shared = tokenSource({ kind: "omp", provider: "provider" }, () => {
+    calls++;
+    return pending.promise;
+  });
+  const first = shared.get();
+  const second = shared.get();
+  await Promise.resolve();
+  assert.equal(calls, 1);
+  pending.resolve("shared-token");
+  assert.deepEqual(await Promise.all([first, second]), ["shared-token", "shared-token"]);
+  assert.equal(await shared.get(), "shared-token");
+  assert.equal(calls, 1);
+
+  const runs: PromiseWithResolvers<string>[] = [];
+  const invalidated = tokenSource({ kind: "omp", provider: "provider" }, () => {
+    const pending = Promise.withResolvers<string>();
+    runs.push(pending);
+    return pending.promise;
+  });
+  const stale = invalidated.get();
+  await Promise.resolve();
+  invalidated.invalidate();
+  runs[0]!.resolve("stale-token");
+  assert.equal(await stale, "stale-token");
+  const fresh = invalidated.get();
+  await Promise.resolve();
+  runs[1]!.resolve("fresh-token");
+  assert.equal(await fresh, "fresh-token");
+  assert.equal(await invalidated.get(), "fresh-token");
+  assert.equal(runs.length, 2);
+});
+
+test("authorizedFetch replaces authorization case-insensitively and bearer does not retry", async t => {
+  const requests: { headers: Headers; method?: string; body?: BodyInit | null }[] = [];
+  let status = 200;
+  t.mock.method(globalThis, "fetch", async (_url: string | URL | Request, init?: RequestInit) => {
+    requests.push({ headers: new Headers(init?.headers), method: init?.method, body: init?.body });
+    return new Response(null, { status });
+  });
+  const config: Config = {
+    base: "https://memory.example",
+    headers: { "X-Entry": "kept", authorization: "Bearer stale" },
+    auth: { kind: "bearer", token: "static-token" },
+  };
+  const source = tokenSource(config.auth, async () => { throw new Error("runner must not execute"); });
+  await authorizedFetch(config, source, "https://memory.example/api/pages/X", { method: "PUT", body: "content", headers: { "X-Request": "yes" } });
+  assert.equal(requests[0]!.headers.get("Authorization"), "Bearer static-token");
+  assert.deepEqual([...requests[0]!.headers.keys()].filter(name => name.toLowerCase() === "authorization"), ["authorization"]);
+  assert.equal(requests[0]!.headers.get("X-Entry"), "kept");
+  assert.equal(requests[0]!.headers.get("X-Request"), "yes");
+  assert.equal(requests[0]!.method, "PUT");
+  assert.equal(requests[0]!.body, "content");
+
+  status = 401;
+  const response = await authorizedFetch(config, source, "https://memory.example/api/recall?q=x");
+  assert.equal(response.status, 401);
+  assert.equal(requests.length, 2);
+});
+
+test("authorizedFetch retries omp once with a new token and fails without a token", async t => {
+  let calls = 0;
+  const tokens = ["first-token", "second-token"];
+  const authorizations: (string | null)[] = [];
+  t.mock.method(globalThis, "fetch", async (_url: string | URL | Request, init?: RequestInit) => {
+    calls++;
+    authorizations.push(new Headers(init?.headers).get("Authorization"));
+    return new Response(null, { status: calls === 1 ? 401 : 200 });
+  });
+  const config: Config = {
+    base: "https://memory.example", headers: {},
+    auth: { kind: "omp", provider: "provider" },
+  };
+  const source = tokenSource(config.auth, async () => tokens.shift());
+  const response = await authorizedFetch(config, source, "https://memory.example/api/recall?q=x");
+  assert.equal(response.status, 200);
+  assert.equal(calls, 2);
+  assert.deepEqual(authorizations, ["Bearer first-token", "Bearer second-token"]);
+
+  const unavailable = tokenSource(config.auth, async () => undefined);
+  await assert.rejects(authorizedFetch(config, unavailable, "https://memory.example/api/recall?q=x"));
+  assert.equal(calls, 2);
+});
+
 test("Pensieve memory helpers", () => {
   const file = { mcpServers: { pensieve: {
     url: "https://memory.example/mcp/", bearerTokenEnv: "SECRET", headers: { "X-Pensieve-Agent": "custom", "X-Other": "yes" },
   } } };
-  assert.deepEqual(resolveConfig({ SECRET: "file-token" }, file), {
-    base: "https://memory.example", headers: { "X-Pensieve-Agent": "custom", "X-Other": "yes", Authorization: "Bearer file-token" },
+  assert.deepEqual(resolveConfig({ SECRET: "file-token" }, { mcp: file }, "pi"), {
+    base: "https://memory.example", headers: { "X-Pensieve-Agent": "custom", "X-Other": "yes" }, auth: { kind: "bearer", token: "file-token" },
   });
-  assert.deepEqual(resolveConfig({ PENSIEVE_URL: "http://localhost:123/mcp", PENSIEVE_TOKEN: "env-token" }, file), {
-    base: "http://localhost:123", headers: { "X-Pensieve-Agent": "pi", Authorization: "Bearer env-token" },
+  assert.deepEqual(resolveConfig({ PENSIEVE_URL: "http://localhost:123/mcp", PENSIEVE_TOKEN: "env-token" }, { mcp: file }, "pi"), {
+    base: "http://localhost:123", headers: { "X-Pensieve-Agent": "pi" }, auth: { kind: "bearer", token: "env-token" },
   });
-  assert.equal(resolveConfig({}, file), undefined);
-  assert.equal(resolveConfig({}, undefined), undefined);
-  assert.equal(resolveConfig({}, { mcpServers: { pensieve: { url: "http://localhost", bearerToken: "token" } } })?.headers["X-Pensieve-Agent"], "pi");
+  assert.equal(resolveConfig({}, { mcp: file }, "pi"), undefined);
+  assert.equal(resolveConfig({}, {}, "pi"), undefined);
+  assert.equal(resolveConfig({}, { mcp: { mcpServers: { pensieve: { url: "http://localhost", bearerToken: "token" } } } }, "pi")?.headers["X-Pensieve-Agent"], "pi");
 
   const now = new Date(2026, 0, 1, 9, 5);
   assert.equal(localDate(now), "2026-01-01");
@@ -254,6 +417,59 @@ const turns = (count: number, first = 0) => Array.from({ length: count }, (_, i)
   type: "message", id: `m${first + i}`, parentId: null,
   message: { role: i % 2 ? "assistant" : "user", content: [{ type: "text", text: `turn ${first + i}` }], stopReason: "stop", timestamp: 0 },
 }));
+
+test("omp OAuth authorizes initialize, snapshot, recall, and journal worker requests", async t => {
+  delete process.env.PENSIEVE_URL;
+  delete process.env.PENSIEVE_TOKEN;
+  const configPath = join(agentDir, "mcp.json");
+  writeFileSync(configPath, JSON.stringify({ mcpServers: { pensieve: {
+    url: "http://pensieve.test/mcp", headers: { "X-Pensieve-Agent": "omp" },
+  } } }));
+  t.after(() => {
+    rmSync(configPath, { force: true });
+    delete process.env.PI_PENSIEVE_JOB;
+  });
+  const requests: { url: string; method: string; headers: Headers }[] = [];
+  t.mock.method(globalThis, "fetch", async (url: string | URL | Request, init?: RequestInit) => {
+    const target = new URL(String(url));
+    requests.push({ url: target.toString(), method: init?.method ?? "GET", headers: new Headers(init?.headers) });
+    if (target.pathname === "/mcp") return Response.json({ result: { instructions: "guide" } });
+    if (target.pathname === "/api/recall") return Response.json({ reranked: false, tokens: 0, passages: [], leads: [] });
+    if (init?.method === "PUT") return new Response(null, { status: 200 });
+    return new Response(null, { status: 404 });
+  });
+  const providers: string[] = [];
+  const deps = { host: "omp" as const, runner: async (provider: string) => {
+    providers.push(provider);
+    return "oauth-token";
+  } };
+  const on = load(deps);
+  const ctx = { hasUI: false, cwd: "/work/repo" };
+  await on.session_start({ reason: "startup" }, ctx);
+  await on.before_agent_start({ prompt: "remember this", systemPromptOptions: {} }, ctx);
+
+  assert.equal(requests.filter(request => new URL(request.url).pathname === "/mcp").length, 1);
+  assert.equal(requests.filter(request => new URL(request.url).pathname.startsWith("/api/pages/")).length, 3);
+  assert.equal(requests.filter(request => new URL(request.url).pathname === "/api/recall").length, 1);
+  for (const request of requests) {
+    assert.equal(request.headers.get("Authorization"), "Bearer oauth-token");
+    assert.equal(request.headers.get("X-Pensieve-Agent"), "omp");
+  }
+
+  const mainRequests = requests.length;
+  process.env.PI_PENSIEVE_JOB = JSON.stringify({
+    dir: join(agentDir, "oauth-worker"), project: "repo", sessionId: "abcdefgh-123", time: Date.now(),
+  });
+  const worker = load(deps);
+  const reply = { sessionManager: { getBranch: () => turns(2).map((entry, i) => i ? entry : { ...entry, message: { ...entry.message, role: "assistant" } }).reverse() } };
+  await worker.session_shutdown({ reason: "quit" }, reply);
+  const workerRequests = requests.slice(mainRequests);
+  assert.deepEqual(workerRequests.map(request => request.method), ["GET", "PUT"]);
+  assert.ok(workerRequests.every(request => new URL(request.url).pathname.includes("/api/pages/Journal%20")));
+  for (const request of workerRequests) assert.equal(request.headers.get("Authorization"), "Bearer oauth-token");
+  assert.ok(providers.length >= 2);
+  assert.ok(providers.every(provider => provider === "mcp_oauth:profile:default:http://pensieve.test/mcp"));
+});
 
 test("journals the part of the session after the cursor on idle, compaction and session change", async t => {
   process.env.PENSIEVE_URL = "http://pensieve.test/mcp";
