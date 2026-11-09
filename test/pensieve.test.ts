@@ -425,6 +425,7 @@ test("recalls memory for the first prompt of a session and after compaction", as
 
   const on = load();
   await on.session_start({}, ctx);
+  assert.equal(await on.before_agent_start({ messageType: "custom", message: {}, systemPromptOptions: {} }, ctx), undefined);
   assert.equal(await turn(on, "  "), undefined);
   assert.equal(recalls.length, 0);
   const first = await turn(on, `  ${"q".repeat(600)}  `);
